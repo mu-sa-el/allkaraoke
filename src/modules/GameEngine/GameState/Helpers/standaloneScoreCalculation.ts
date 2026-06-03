@@ -1,0 +1,655 @@
+import { MIDDLEA, SEMITONE, noDistanceNoteTypes, noPointsNoteTypes } from 'consts';
+import { DetailedScore, FrequencyRecord, Note, NotesSection, PlayerNote, Song, SongTrack } from 'interfaces';
+import pitchToFrequency from 'modules/utils/pitchToFrequency';
+import AubioStrategy from 'modules/GameEngine/Input/MicStrategies/Aubio';
+import getSongBeatLength from 'modules/Songs/utils/getSongBeatLength';
+import isNotesSection from 'modules/Songs/utils/isNotesSection';
+import { getNoteAtBeat } from 'modules/Songs/utils/notesSelectors';
+import detectVibrato from './detectVibrato';
+
+export const MAX_POINTS = 3_500_000;
+const SINGING_BREAK_TOLERANCE_MS = 100;
+
+const noteTypesMultipliers: DetailedScore = {
+  freestyle: 0.25,
+  rap: 0.25,
+  rapstar: 0.5,
+  star: 2,
+  normal: 1,
+  perfect: 0,
+  vibrato: 0,
+};
+
+// Pitch detection helpers
+const pitchFromFrequency = (freq: number) => Math.round(12 * (Math.log(freq / MIDDLEA) / Math.log(2))) + SEMITONE;
+
+const getDistanceInCents = (noteFreq: number, freq: number) =>
+  Math.floor((1200 * Math.log(freq / noteFreq)) / Math.log(2));
+
+const getCentDistance = (targetNote: number, freq: number, tolerance: number) => {
+  const noteFreq = pitchToFrequency(targetNote);
+  const cents = getDistanceInCents(noteFreq, freq);
+  const distance = Math.sign(cents) * ((((Math.abs(cents) % 1200) + 600) % 1200) - 600);
+  return distance / (tolerance * 100 + 50);
+};
+
+export const calcDistanceBetweenPitches = (note: number, targetNote: number, tolerance: number) => {
+  const noteDistance = note - targetNote;
+  return Math.abs(noteDistance) <= tolerance ? 0 : noteDistance;
+};
+
+export const calcDistanceStandalone = (frequency: number, targetNote: number, tolerance: number) => {
+  const note = pitchFromFrequency(frequency);
+  let preciseDistance: number = -1;
+  const distance = calcDistanceBetweenPitches(note, targetNote, tolerance);
+
+  if (distance === 0) {
+    preciseDistance = getCentDistance(targetNote, frequency, tolerance);
+  }
+
+  return { distance, preciseDistance };
+};
+
+// Score calculation helpers
+const countsToBeats = (counts: DetailedScore): DetailedScore => ({
+  freestyle: counts.freestyle * noteTypesMultipliers.freestyle,
+  rap: counts.rap * noteTypesMultipliers.rap,
+  rapstar: counts.rapstar * noteTypesMultipliers.rapstar,
+  star: counts.star * noteTypesMultipliers.star,
+  normal: counts.normal * noteTypesMultipliers.normal,
+  perfect: counts.perfect * noteTypesMultipliers.perfect,
+  vibrato: counts.vibrato * noteTypesMultipliers.vibrato,
+});
+
+export const sumDetailedScore = (counts: DetailedScore) =>
+  counts.freestyle + counts.rap + counts.star + counts.normal + counts.perfect + counts.vibrato;
+
+function countSungBeats(track: SongTrack): DetailedScore {
+  const counts: DetailedScore = {
+    freestyle: 0,
+    rap: 0,
+    rapstar: 0,
+    star: 0,
+    normal: 0,
+    perfect: 0,
+    vibrato: 0,
+  };
+
+  track.sections.filter(isNotesSection).forEach((section) => {
+    const notes = section.notes.filter((note) => !noPointsNoteTypes.includes(note.type));
+
+    notes.forEach((note) => {
+      counts[note.type] = counts[note.type] + note.length;
+      counts.perfect = counts.perfect + note.length;
+      counts.vibrato = counts.vibrato + note.length;
+    });
+  });
+
+  return counts;
+}
+
+function getPlayerNoteDistance(note: PlayerNote) {
+  return noDistanceNoteTypes.includes(note.note.type) ? 0 : note.distance;
+}
+
+export const calcDistance = (frequency: number, targetNote: number, tolerance: number) => {
+  const note = pitchFromFrequency(frequency);
+  let preciseDistance: number = -1;
+  const distance = calcDistanceBetweenPitches(note, targetNote, tolerance);
+
+  if (distance === 0) {
+    preciseDistance = getCentDistance(targetNote, frequency, tolerance);
+  }
+
+  return { distance, preciseDistance };
+};
+
+export function appendFrequencyToPlayerNotesStandalone(
+  playerNotes: PlayerNote[],
+  record: FrequencyRecord,
+  note: Note,
+  beatLength: number,
+  tolerance: number,
+) {
+  const noteEndBeat = note.start + note.length;
+  const breakToleranceBeat = SINGING_BREAK_TOLERANCE_MS / beatLength;
+
+  // Change 2: Piano decay — frequency=0 frames within the active note window extend the segment
+  // rather than breaking it. Bridges natural decay gaps without creating split segments.
+  if (record.frequency === 0) {
+    const lastNote = playerNotes.at(-1);
+    const currentBeat = Math.max(0, record.timestamp) / beatLength;
+    if (lastNote && lastNote.note.start === note.start && lastNote.distance === 0 && currentBeat <= noteEndBeat) {
+      lastNote.length = Math.max(0, Math.min(currentBeat, noteEndBeat) - lastNote.start);
+      lastNote.isPerfect = Math.abs(lastNote.length - lastNote.note.length) < 0.5;
+    }
+    return;
+  }
+
+  const noteCandidate = {
+    ...record,
+    beat: Math.max(0, record.timestamp) / beatLength,
+    ...calcDistance(record.frequency, note.pitch, tolerance),
+  };
+  const lastNote = playerNotes.at(-1);
+
+  const isThisNoteDifferentThanLast = !lastNote || lastNote.note.start !== note.start;
+  const isDistanceDifferent =
+    !lastNote || (lastNote.distance !== noteCandidate.distance && !noDistanceNoteTypes.includes(note.type));
+
+  // Change 3: End-of-note measurement noise — wrong frequency in last 0.5 beats of a note
+  // gets ignored; the previous correct segment is extended to the note's end instead.
+  if (
+    !isThisNoteDifferentThanLast &&
+    isDistanceDifferent &&
+    noteCandidate.distance !== 0 &&
+    noteEndBeat - noteCandidate.beat < 0.5 &&
+    lastNote &&
+    lastNote.distance === 0
+  ) {
+    lastNote.length = Math.max(0, noteEndBeat - lastNote.start);
+    lastNote.isPerfect = Math.abs(lastNote.length - lastNote.note.length) < 0.5;
+    return;
+  }
+
+  if (
+    isThisNoteDifferentThanLast ||
+    isDistanceDifferent ||
+    noteCandidate.beat - (lastNote.start + lastNote.length) > breakToleranceBeat
+  ) {
+    const roundedStart = noteCandidate.beat - breakToleranceBeat < note.start ? note.start : noteCandidate.beat;
+    playerNotes.push({
+      // If this is the first player note for the note, round player note start to note's start
+      start: Math.min(isThisNoteDifferentThanLast ? roundedStart : noteCandidate.beat, noteEndBeat),
+      length: 0,
+      distance: noteCandidate.distance,
+      note,
+      isPerfect: false,
+      vibrato: false,
+      frequencyRecords: [
+        {
+          frequency: noteCandidate.frequency,
+          preciseDistance: noteCandidate.preciseDistance,
+          timestamp: noteCandidate.timestamp,
+        },
+      ],
+    });
+
+    // Round the last player note length to the end of the note, so it looks a bit smoother
+    if (lastNote && note.start !== lastNote.note.start) {
+      const lastPlayerNoteEndBeat = lastNote.start + lastNote.length;
+      const lastNoteEndBeat = lastNote.note.start + lastNote.note.length;
+      const roundedLength =
+        lastPlayerNoteEndBeat + breakToleranceBeat > lastNoteEndBeat ? lastNoteEndBeat : lastPlayerNoteEndBeat;
+      lastNote.length = Math.max(0, roundedLength - lastNote.start);
+    }
+  } else {
+    lastNote.length = Math.max(0, Math.min(noteCandidate.beat, note.start + note.length) - lastNote.start);
+    lastNote.frequencyRecords.push({
+      frequency: noteCandidate.frequency,
+      timestamp: noteCandidate.timestamp,
+      preciseDistance: noteCandidate.preciseDistance,
+    });
+
+    lastNote.isPerfect = lastNote.distance === 0 && Math.abs(lastNote.length - lastNote.note.length) < 0.5;
+
+    lastNote.vibrato = lastNote.distance === 0 && detectVibrato(lastNote.frequencyRecords);
+  }
+}
+
+// OLA (Overlap-Add) time stretching: changes tempo without affecting pitch.
+// Using playbackRate would shift both speed and pitch together, which breaks note detection.
+async function resampleBuffer(buffer: AudioBuffer, speed: number): Promise<AudioBuffer> {
+  if (speed === 1.0) return buffer;
+
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const inputLength = buffer.length;
+  const outputLength = Math.ceil(inputLength / speed);
+
+  const FRAME_SIZE = 2048;
+  const HOP_INPUT = FRAME_SIZE / 2;
+  const HOP_OUTPUT = Math.round(HOP_INPUT / speed);
+
+  // Hann window for smooth overlap-add
+  const win = new Float32Array(FRAME_SIZE);
+  for (let i = 0; i < FRAME_SIZE; i++) {
+    win[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (FRAME_SIZE - 1)));
+  }
+
+  const outputChannels = Array.from({ length: numChannels }, () => new Float32Array(outputLength));
+  const normalization = new Float32Array(outputLength);
+
+  for (let ch = 0; ch < numChannels; ch++) {
+    const inputData = buffer.getChannelData(ch);
+    const outputData = outputChannels[ch];
+    let outputPos = 0;
+
+    for (let inputPos = 0; inputPos < inputLength; inputPos += HOP_INPUT) {
+      for (let i = 0; i < FRAME_SIZE; i++) {
+        const inIdx = inputPos + i;
+        const outIdx = outputPos + i;
+        if (inIdx < inputLength && outIdx < outputLength) {
+          outputData[outIdx] += inputData[inIdx] * win[i];
+          if (ch === 0) normalization[outIdx] += win[i];
+        }
+      }
+      outputPos += HOP_OUTPUT;
+    }
+  }
+
+  // Normalize amplitude to compensate for overlap
+  for (let ch = 0; ch < numChannels; ch++) {
+    const outputData = outputChannels[ch];
+    for (let i = 0; i < outputLength; i++) {
+      if (normalization[i] > 1e-6) outputData[i] /= normalization[i];
+    }
+  }
+
+  const offlineCtx = new OfflineAudioContext(numChannels, outputLength, sampleRate);
+  const outBuffer = offlineCtx.createBuffer(numChannels, outputLength, sampleRate);
+  outputChannels.forEach((ch, i) => outBuffer.copyToChannel(ch, i));
+  return outBuffer;
+}
+
+/**
+ * Decode an MP3 file to PCM audio samples.
+ */
+export async function decodeAudioFile(
+  fileOrUrl: File | string,
+  resampleSpeed: number,
+): Promise<{ samples: Float32Array; sampleRate: number }> {
+  let arrayBuffer: ArrayBuffer;
+
+  if (typeof fileOrUrl === 'string') {
+    const response = await fetch(fileOrUrl);
+    arrayBuffer = await response.arrayBuffer();
+  } else {
+    arrayBuffer = await fileOrUrl.arrayBuffer();
+  }
+
+  // Use a regular AudioContext to decode
+  const audioContext = new AudioContext();
+  //const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  const audioBuffer = await resampleBuffer(await audioContext.decodeAudioData(arrayBuffer), resampleSpeed);
+  await audioContext.close();
+
+  // Get mono audio (mix channels if stereo)
+  const numberOfChannels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const samples = new Float32Array(length);
+
+  if (numberOfChannels === 1) {
+    audioBuffer.copyFromChannel(samples, 0);
+  } else {
+    // Mix down to mono
+    const channel0 = audioBuffer.getChannelData(0);
+    const channel1 = audioBuffer.getChannelData(1);
+    for (let i = 0; i < length; i++) {
+      samples[i] = (channel0[i] + channel1[i]) / 2;
+    }
+  }
+
+  return { samples, sampleRate: audioBuffer.sampleRate };
+}
+
+/**
+ * Run pitch detection on audio samples and return frequency records.
+ */
+export async function detectPitchesFromSamples(
+  samples: Float32Array,
+  sampleRate: number,
+  fftSize: number = 2048,
+): Promise<FrequencyRecord[]> {
+  const strategy = new AubioStrategy();
+
+  // Create a dummy context just for initialization
+  const dummyContext = new AudioContext({ sampleRate });
+  await strategy.init(dummyContext, fftSize);
+  await dummyContext.close();
+
+  const frequencyRecords: FrequencyRecord[] = [];
+  const hopSize = fftSize; // Process non-overlapping frames
+  const msPerSample = 1000 / sampleRate;
+
+  for (let i = 0; i + fftSize <= samples.length; i += hopSize) {
+    const frame = samples.slice(i, i + fftSize);
+    const frequency = await strategy.getFrequency(frame);
+
+    // Timestamp is at the center of the frame
+    const timestamp = (i + fftSize / 2) * msPerSample;
+
+    frequencyRecords.push({
+      timestamp,
+      frequency,
+    });
+  }
+
+  return frequencyRecords;
+}
+
+/**
+ * Get the section index containing a specific beat.
+ */
+function getSectionIndexByBeat(track: SongTrack, beat: number): number {
+  return track.sections.findIndex((section, index, sections) => {
+    if (beat < 0) return true;
+    if (beat < section.start) return false;
+    if (index === sections.length - 1) return true;
+    return sections[index + 1].start > beat;
+  });
+}
+
+/**
+ * Convert frequency records to player notes by matching against song notes.
+ */
+export function convertFrequencyRecordsToPlayerNotes(
+  frequencyRecords: FrequencyRecord[],
+  song: Song,
+  trackNumber: number,
+  tolerance: number,
+  inputLagMs: number = 100,
+): PlayerNote[] {
+  const playerNotes: PlayerNote[] = [];
+  const track = song.tracks[trackNumber];
+  const beatLength = getSongBeatLength(song);
+
+  for (const record of frequencyRecords) {
+    // Adjust for input lag
+    const adjustedTimestamp = record.timestamp - inputLagMs;
+    const adjustedRecord = { ...record, timestamp: adjustedTimestamp };
+
+    const recordBeat = adjustedTimestamp / beatLength;
+    const sectionIndex = getSectionIndexByBeat(track, recordBeat);
+    const section = track.sections[sectionIndex];
+
+    if (section && isNotesSection(section)) {
+      const note = getNoteAtBeat(section, recordBeat, 0) ?? getNoteAtBeat(section, recordBeat, 0.5);
+
+      if (note) {
+        appendFrequencyToPlayerNotesStandalone(playerNotes, adjustedRecord, note, beatLength, tolerance);
+      }
+    }
+  }
+
+  return playerNotes;
+}
+
+export interface StandaloneScoreResult {
+  score: number;
+  pointsPerBeat: number;
+  counts: DetailedScore;
+  maxCounts: DetailedScore;
+  playerNotes: PlayerNote[];
+  frequencyRecords: FrequencyRecord[];
+  beatLength: number;
+  statsPlayed: Record<string, number>;
+  statsPerfect: Record<string, number>;
+}
+
+/**
+ * Calculate detailed score data from player notes (standalone version).
+ */
+export function calculateDetailedScoreDataStandalone(
+  playerNotes: PlayerNote[],
+  track: SongTrack,
+): [number, DetailedScore, DetailedScore] {
+  const counts: DetailedScore = {
+    freestyle: 0,
+    rap: 0,
+    rapstar: 0,
+    star: 0,
+    normal: 0,
+    perfect: 0,
+    vibrato: 0,
+  };
+
+  const maxCounts = countsToBeats(countSungBeats(track));
+  const pointsPerBeat = MAX_POINTS / sumDetailedScore(maxCounts);
+
+  for (let i = 0; i < playerNotes.length; i++) {
+    const note = playerNotes[i];
+    if (noPointsNoteTypes.includes(note.note.type)) continue;
+    if (getPlayerNoteDistance(note) !== 0) continue;
+
+    counts[note.note.type] = counts[note.note.type] + note.length;
+
+    if (note.isPerfect) counts.perfect = counts.perfect + note.length;
+    if (note.vibrato) counts.vibrato = counts.vibrato + note.length;
+  }
+
+  return [pointsPerBeat, countsToBeats(counts), maxCounts];
+}
+
+const NOTE_NAMES = [
+  'C-1',
+  'C#-1',
+  'D-1',
+  'D#-1',
+  'E-1',
+  'F-1',
+  'F#-1',
+  'G-1',
+  'G#-1',
+  'A-1',
+  'A#-1',
+  'B-1',
+  'C0',
+  'C#0',
+  'D0',
+  'D#0',
+  'E0',
+  'F0',
+  'F#0',
+  'G0',
+  'G#0',
+  'A0',
+  'A#0',
+  'B0',
+  'C1',
+  'C#1',
+  'D1',
+  'D#1',
+  'E1',
+  'F1',
+  'F#1',
+  'G1',
+  'G#1',
+  'A1',
+  'A#1',
+  'B1',
+  'C2',
+  'C#2',
+  'D2',
+  'D#2',
+  'E2',
+  'F2',
+  'F#2',
+  'G2',
+  'G#2',
+  'A2',
+  'A#2',
+  'B2',
+  'C3',
+  'C#3',
+  'D3',
+  'D#3',
+  'E3',
+  'F3',
+  'F#3',
+  'G3',
+  'G#3',
+  'A3',
+  'A#3',
+  'B3',
+  'C4',
+  'C#4',
+  'D4',
+  'D#4',
+  'E4',
+  'F4',
+  'F#4',
+  'G4',
+  'G#4',
+  'A4',
+  'A#4',
+  'B4',
+  'C5',
+  'C#5',
+  'D5',
+  'D#5',
+  'E5',
+  'F5',
+  'F#5',
+  'G5',
+  'G#5',
+  'A5',
+  'A#5',
+  'B5',
+  'C6',
+  'C#6',
+  'D6',
+  'D#6',
+  'E6',
+  'F6',
+  'F#6',
+  'G6',
+  'G#6',
+  'A6',
+  'A#6',
+  'B6',
+  'C7',
+  'C#7',
+  'D7',
+  'D#7',
+  'E7',
+  'F7',
+  'F#7',
+  'G7',
+  'G#7',
+  'A7',
+  'A#7',
+  'B7',
+  'C8',
+  'C#8',
+  'D8',
+  'D#8',
+  'E8',
+  'F8',
+  'F#8',
+  'G8',
+  'G#8',
+];
+
+function pitchToNoteName(pitch: number) {
+  return `${NOTE_NAMES[pitch]}`;
+}
+
+function getNoteNameStats(notes: PlayerNote[]) {
+  const statsPlayed: Record<string, number> = {};
+  const statsPerfect: Record<string, number> = {};
+
+  for (const n of notes) {
+    const name = pitchToNoteName(n.note.pitch)!;
+    statsPlayed[name] = (statsPlayed[name] ?? 0) + 1;
+    if (n.isPerfect) statsPerfect[name] = (statsPerfect[name] ?? 0) + 1;
+  }
+
+  return { statsPlayed, statsPerfect };
+}
+
+/**
+ * Main standalone function to calculate score from an MP3 file and a song.
+ *
+ * @param mp3FileOrUrl - The MP3 file (as File object) or URL to the MP3 file
+ * @param song - The song object (converted from ultrastar.txt)
+ * @param trackNumber - The track number to score against (default: 0)
+ * @param tolerance - The pitch tolerance in semitones (default: 0)
+ * @param inputLagMs - Input lag compensation in milliseconds (default: 100)
+ * @param fftSize - FFT size for pitch detection (default: 2048)
+ * @returns Promise containing score results
+ */
+export async function calculateScoreFromMp3(
+  mp3FileOrUrl: File | string,
+  song: Song,
+  trackNumber: number = 0,
+  tolerance: number = 0,
+  inputLagMs: number = 100,
+  fftSize: number = 2048,
+  resample_speed = 1,
+): Promise<StandaloneScoreResult> {
+  // Step 1: Decode the MP3 file to audio samples
+  const { samples, sampleRate } = await decodeAudioFile(mp3FileOrUrl, resample_speed);
+
+  // Step 2: Run pitch detection to get frequency records
+  const frequencyRecords = await detectPitchesFromSamples(samples, sampleRate, fftSize);
+
+  // Step 3: Convert frequency records to player notes
+  const playerNotes = convertFrequencyRecordsToPlayerNotes(
+    frequencyRecords,
+    song,
+    trackNumber,
+    tolerance,
+    inputLagMs,
+  ).filter((el) => el.length > 0);
+
+  // Step 4: Calculate score
+  const track = song.tracks[trackNumber];
+  const [pointsPerBeat, counts, maxCounts] = calculateDetailedScoreDataStandalone(playerNotes, track);
+  const score = sumDetailedScore(counts) * pointsPerBeat;
+
+  //Add beat length for later ms conversion
+  const beatLength = getSongBeatLength(song);
+
+  const stats = getNoteNameStats(playerNotes);
+  const statsPlayed = stats.statsPlayed;
+  const statsPerfect = stats.statsPerfect;
+
+  return {
+    score,
+    pointsPerBeat,
+    counts,
+    maxCounts,
+    playerNotes,
+    frequencyRecords,
+    beatLength,
+    statsPlayed,
+    statsPerfect,
+  };
+}
+
+/**
+ * Calculate score from already-extracted frequency records (useful when you already have the pitch data).
+ */
+export function calculateScoreFromFrequencies(
+  frequencyRecords: FrequencyRecord[],
+  song: Song,
+  trackNumber: number = 0,
+  tolerance: number = 0,
+  inputLagMs: number = 100,
+): StandaloneScoreResult {
+  const playerNotes = convertFrequencyRecordsToPlayerNotes(frequencyRecords, song, trackNumber, tolerance, inputLagMs);
+
+  const track = song.tracks[trackNumber];
+  const [pointsPerBeat, counts, maxCounts] = calculateDetailedScoreDataStandalone(playerNotes, track);
+  const score = sumDetailedScore(counts) * pointsPerBeat;
+
+  //Add beat length for later ms conversion
+  const beatLength = getSongBeatLength(song);
+
+  const stats = getNoteNameStats(playerNotes);
+  const statsPlayed = stats.statsPlayed;
+  const statsPerfect = stats.statsPerfect;
+
+  return {
+    score,
+    pointsPerBeat,
+    counts,
+    maxCounts,
+    playerNotes,
+    frequencyRecords,
+    beatLength,
+    statsPlayed,
+    statsPerfect,
+  };
+}

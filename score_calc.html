@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Standalone Score Calculation Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; max-width: 800px; margin: 0 auto; }
+    pre { background: #f0f0f0; padding: 10px; overflow-x: auto; }
+    button { padding: 10px 20px; font-size: 16px; margin: 10px 0; cursor: pointer; }
+    .result { margin-top: 20px; }
+    .error { color: red; }
+    .success { color: green; }
+  </style>
+</head>
+<body>
+  <h1>Standalone Score Calculation Test</h1>
+  <p>This page tests the standalone score calculation with MP3 and MIDI files.</p>
+
+  <div style="margin: 20px 0; padding: 15px; border: 1px solid #ccc; border-radius: 5px;">
+    <h3>Upload Files</h3>
+    <div style="margin: 10px 0;">
+      <label for="mp3Upload"><strong>MP3 File:</strong></label><br>
+      <input type="file" id="mp3Upload" accept=".mp3,audio/mpeg" style="margin-top: 5px;">
+      <span id="mp3Status" style="margin-left: 10px; color: #666;"></span>
+    </div>
+    <div style="margin: 10px 0;">
+      <label for="midiUpload"><strong>MIDI File:</strong></label><br>
+      <input type="file" id="midiUpload" accept=".mid,.midi" style="margin-top: 5px;">
+      <span id="songStatus" style="margin-left: 10px; color: #666;"></span>
+    </div>
+    <div style="margin: 10px 0;">
+      <label for="inputLagms"><strong>Input lag in ms:</strong></label><br>
+      <input type="number" id="inputLagms" step="any" />
+    </div>
+    <div style="margin: 10px 0;">
+      <label for="resampleSpeed"><strong>Resample Speed:</strong></label><br>
+      <input type="number" id="resampleSpeed" step="any" />
+    </div>
+    </div>
+  </div>
+
+  <div style="margin: 20px 0;">
+    <button id="runTest">Run Score Calculation Test</button>
+  </div>
+
+  <div id="output" class="result"></div>
+
+  <script type="module">
+    // These imports work when running via Vite dev server (pnpm start:mock)
+    const { calculateScoreFromMp3, sumDetailedScore } = await import('/src/modules/GameEngine/GameState/Helpers/standaloneScoreCalculation.ts');
+    const { convertMidiToSong, getMidiInfo } = await import('/src/modules/utils/parseMidiToSong.ts');
+
+    const output = document.getElementById('output');
+    const mp3Upload = document.getElementById('mp3Upload');
+    const midiUpload = document.getElementById('midiUpload');
+    const mp3Status = document.getElementById('mp3Status');
+    const songStatus = document.getElementById('songStatus');
+    const inputLagmsElement = document.getElementById('inputLagms');
+    const resampleSpeedElement = document.getElementById('resampleSpeed');
+
+    let uploadedMp3 = null;
+    let uploadedSong = null; // Can be from TXT or MIDI
+    let songSource = null; // 'txt' or 'midi'
+
+    mp3Upload.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        uploadedMp3 = file;
+        mp3Status.textContent = `Selected: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
+        mp3Status.style.color = 'green';
+      }
+    });
+
+    const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+    function frequencyToNoteName(freq) {
+      if (freq <= 0) return null;
+
+      // MIDI note number (A4 = 440 Hz → 69)
+      const midi = Math.round(12 * Math.log2(freq / 440) + 69);
+
+      const noteIndex = ((midi % 12) + 12) % 12;
+      const octave = Math.floor(midi / 12) - 1;
+
+      return {
+        midi,
+        note: NOTE_NAMES[noteIndex],
+        octave,
+        name: `${NOTE_NAMES[noteIndex]}${octave}`,
+      };
+    }
+
+    midiUpload.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const arrayBuffer = await file.arrayBuffer();
+        try {
+          const info = getMidiInfo(arrayBuffer);
+          uploadedSong = convertMidiToSong(arrayBuffer, file.name.replace(/\.(mid|midi)$/i, ''), 'MIDI');
+          songSource = 'midi';
+          songStatus.textContent = `MIDI loaded: ${info.noteCount} notes, ${(info.durationMs / 1000).toFixed(1)}s, ${info.bpm.toFixed(1)} BPM`;
+          songStatus.style.color = 'green';
+        } catch (err) {
+          songStatus.textContent = `Error parsing MIDI: ${err.message}`;
+          songStatus.style.color = 'red';
+          uploadedSong = null;
+        }
+      }
+    });
+
+    function log(message, isError = false) {
+      const div = document.createElement('div');
+      div.className = isError ? 'error' : '';
+      div.textContent = message;
+      output.appendChild(div);
+    }
+
+    function logPre(obj) {
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(obj, null, 2);
+      output.appendChild(pre);
+    }
+
+    async function runScoreCalculation(mp3Source, song, sourceType = 'txt') {
+      output.innerHTML = '<p>Running test...</p>';
+
+      try {
+        log(`Song source: ${sourceType === 'midi' ? 'MIDI file' : 'no source'}`);
+
+        log(`Song loaded: ${song.title} by ${song.artist}`);
+        log(`BPM: ${song.bpm}, GAP: ${song.gap}`);
+
+        const notes = song.tracks[0].sections.flatMap(s => s.type === 'notes' ? s.notes : []);
+        log(`Notes in track 0: ${notes.length}`);
+        log('Notes:');
+        logPre(notes.map(n => ({ start: n.start, length: n.length, pitch: n.pitch, noteName: n.noteName, lyrics: n.lyrics })));
+
+        // Calculate score from MP3
+        log('');
+        log('Calculating score from MP3...');
+        log('This may take a moment for pitch detection...');
+
+        const startTime = performance.now();
+
+        const inputLagms = inputLagmsElement.valueAsNumber;
+        const finalInputLag = isNaN(inputLagms) ? 0 : inputLagms;
+
+        const resampleSpeed = resampleSpeedElement.valueAsNumber;
+        const finalResampleSpeed = isNaN(resampleSpeed) ? 1 : resampleSpeed;
+
+        const result = await calculateScoreFromMp3(
+          mp3Source,
+          song,
+          0,    // track number
+          0,    // tolerance (semitones)
+          finalInputLag,  // input lag ms
+          2048,  // fft size
+          finalResampleSpeed,
+        );
+        const endTime = performance.now();
+
+        log(`Processing time: ${((endTime - startTime) / 1000).toFixed(2)}s`);
+        log('');
+        log('=== RESULTS ===', false);
+        log(`Score: ${result.score.toFixed(0)} / ${(sumDetailedScore(result.maxCounts) * result.pointsPerBeat).toFixed(0)} (${((result.score / (sumDetailedScore(result.maxCounts) * result.pointsPerBeat)) * 100).toFixed(1)}%)`);
+        log(`Frequency records: ${result.frequencyRecords.length}`);
+        log(`Player notes: ${result.playerNotes.length}`);
+        log(`Points per beat: ${result.pointsPerBeat.toFixed(2)}`);
+        log(`Song beat length in ms: ${result.beatLength}`);
+
+        log('');
+        log('Counts:');
+        logPre(result.counts);
+
+        log('Max counts:');
+        logPre(result.maxCounts);
+
+        if (result.playerNotes.length > 0) {
+          log('');
+          log('Player notes:');
+          logPre(result.playerNotes.map(pn => ({
+            start: pn.start.toFixed(2),
+            start_ms: Number(pn.start.toFixed(2))*result.beatLength,
+            length: pn.length.toFixed(2),
+            distance: pn.distance,
+            notePitch: pn.note.pitch,
+            noteName: pn.note.noteName,
+            noteStart: pn.note.start,
+            isPerfect: pn.isPerfect
+          })));
+        }
+
+        if (result.playerNotes.length > 0) {
+          log('');
+          log('Player notes statistics:');
+          logPre(result.statsPlayed);
+          logPre(result.statsPerfect);
+        }
+
+
+        // Also show some frequency records for debugging
+        log('');
+        log('Sample frequency records:');
+        log('Keep in mind, that midi notes are also heard on audio and might be picked up inbetween.');
+        const nonZeroFreqs = result.frequencyRecords.filter(f => f.frequency > 0);
+        logPre(nonZeroFreqs.map(f => ({
+          timestamp: f.timestamp.toFixed(1) + 'ms',
+          frequency: f.frequency.toFixed(1) + 'Hz',
+          name: frequencyToNoteName(f.frequency.toFixed(1)).name,
+        })));
+
+        log('');
+        log('Test completed successfully!', false);
+
+      } catch (error) {
+        log(`Error: ${error.message}`, true);
+        console.error(error);
+      }
+    }
+
+    // Run with uploaded files
+    document.getElementById('runTest').addEventListener('click', async () => {
+      if (!uploadedMp3 || !uploadedSong) {
+        output.innerHTML = '<p class="error">Please upload an MP3 file and a MIDI file first.</p>';
+        return;
+      }
+      await runScoreCalculation(uploadedMp3, uploadedSong, songSource);
+    });
+
+  </script>
+</body>
+</html>
